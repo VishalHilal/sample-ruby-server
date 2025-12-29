@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  ruby-server:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - MAX_REQUESTS_PER_MINUTE=100
+      - RATE_LIMIT_WINDOW_SECONDS=60
+    volumes:
+      - .:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
