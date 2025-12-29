@@ -1,14 +1,19 @@
 require "webrick"
 require "json"
+require "sqlite3"
+require "base64"
+require "digest"
+require "bcrypt"
 require_relative "middleware"
+require_relative "database"
+require_relative "auth"
 
 server = WEBrick::HTTPServer.new(
   Port: 3000
 )
 
-# In-memory "database"
-$products = []
-$next_id = 1
+# Database and authentication
+$db = Database.new
 $start_time = Time.now
 
 # Helper to parse JSON body
@@ -70,10 +75,31 @@ def apply_middleware(req, res)
   # Continue with request
   result = yield
   
-  # Log request
+  # Log request to database
+  response_time = ((Time.now - start_time) * 1000).round(2)
+  $db.log_request(
+    req.request_method,
+    req.path,
+    res.status,
+    response_time,
+    req.remote_ip,
+    req['User-Agent']
+  )
+  
+  # Console logging
   RequestLogger.log_request(req, res, start_time)
   
   result
+end
+
+# Authentication middleware
+def require_auth(req, res)
+  user = AuthManager.authenticate_request(req, $db)
+  unless user
+    send_json_response(res, { error: "Authentication required" }, 401)
+    return false
+  end
+  user
 end
 
 # Root route
@@ -84,11 +110,13 @@ server.mount_proc "/" do |req, res|
       endpoints: {
         "GET /" => "API information",
         "GET /health" => "Health check endpoint",
+        "GET /metrics" => "API performance metrics",
+        "POST /auth/register" => "Register user and get API key",
         "GET /products" => "List all products (supports pagination and search)",
-        "POST /products" => "Create a new product",
+        "POST /products" => "Create a new product (requires auth)",
         "GET /product?id=:id" => "Get a specific product",
-        "PUT /product?id=:id" => "Update a specific product",
-        "DELETE /product?id=:id" => "Delete a specific product"
+        "PUT /product?id=:id" => "Update a specific product (requires auth)",
+        "DELETE /product?id=:id" => "Delete a specific product (requires auth)"
       },
       examples: {
         create_product: { name: "Example Product", price: "29.99", category: "electronics" },
@@ -108,9 +136,62 @@ server.mount_proc "/health" do |req, res|
       uptime: Time.now - $start_time,
       version: "1.0.0",
       memory_usage: `ps -o rss= -p #{Process.pid}`.to_i,
-      active_products: $products.length
+      active_products: $db.count_products,
+      database: "connected"
     }
     send_json_response(res, health_data)
+  end
+end
+
+# Metrics endpoint
+server.mount_proc "/metrics" do |req, res|
+  apply_middleware(req, res) do
+    metrics = $db.get_api_stats
+    metrics.merge!({
+      uptime_seconds: Time.now - $start_time,
+      memory_usage_mb: `ps -o rss= -p #{Process.pid}`.to_i / 1024,
+      active_connections: 1, # Could be enhanced with connection tracking
+      rate_limit_config: {
+        max_requests_per_minute: 100,
+        window_seconds: 60
+      }
+    })
+    send_json_response(res, metrics)
+  end
+end
+
+# Authentication endpoints
+server.mount_proc "/auth/register" do |req, res|
+  apply_middleware(req, res) do
+    if req.request_method == "POST"
+      data = parse_body(req)
+      
+      # Validate required fields
+      errors = []
+      errors << "Username required" if data["username"].nil? || data["username"].strip.empty?
+      errors << "Email required" if data["email"].nil? || data["email"].strip.empty?
+      errors << "Password required (min 6 chars)" if data["password"].nil? || data["password"].length < 6
+      
+      if errors.any?
+        send_json_response(res, { errors: errors }, 400)
+        next
+      end
+      
+      # Hash password and create user
+      password_hash = AuthManager.hash_password(data["password"])
+      result = $db.create_user(
+        Sanitizer.clean_string(data["username"]),
+        Sanitizer.clean_string(data["email"]),
+        password_hash
+      )
+      
+      send_json_response(res, {
+        message: "User registered successfully",
+        api_key: result[:api_key]
+      }, 201)
+    else
+      send_json_response(res, { error: "Method Not Allowed" }, 405)
+    end
   end
 end
 
@@ -123,27 +204,18 @@ server.mount_proc "/products" do |req, res|
     end
 
     if req.request_method == "GET"
-      filtered_products = $products.dup
-      
-      # Search functionality
-      if req.query["search"]
-        search_term = Sanitizer.clean_string(req.query["search"]).downcase
-        filtered_products = filtered_products.select do |product|
-          product[:name].downcase.include?(search_term) || 
-          (product[:category] && product[:category].downcase.include?(search_term))
-        end
-      end
-      
-      # Pagination
+      # Get pagination parameters
       page = (req.query["page"] || 1).to_i
-      limit = [(req.query["limit"] || 10).to_i, 100].min # Max 100 items
+      limit = [(req.query["limit"] || 10).to_i, 100].min
       offset = (page - 1) * limit
+      search = req.query["search"]
       
-      total = filtered_products.length
-      paginated_products = filtered_products[offset, limit] || []
+      # Get products from database
+      products = $db.get_all_products(limit, offset, search)
+      total = $db.count_products(search)
       
       response_data = {
-        products: paginated_products,
+        products: products,
         pagination: {
           current_page: page,
           total_items: total,
@@ -155,6 +227,10 @@ server.mount_proc "/products" do |req, res|
       send_json_response(res, response_data)
 
     elsif req.request_method == "POST"
+      # Require authentication for POST
+      user = require_auth(req, res)
+      return unless user
+      
       data = parse_body(req)
       
       # Validate input
@@ -164,18 +240,13 @@ server.mount_proc "/products" do |req, res|
         next
       end
 
-      # Sanitize input
+      # Sanitize input and create product
       sanitized = sanitize_product_data(data)
-      
-      product = {
-        id: $next_id,
-        name: sanitized[:name],
-        price: sanitized[:price],
-        category: sanitized[:category]
-      }
-
-      $products << product
-      $next_id += 1
+      product = $db.create_product(
+        sanitized[:name],
+        sanitized[:price],
+        sanitized[:category]
+      )
 
       send_json_response(res, product, 201)
     else
@@ -199,7 +270,7 @@ server.mount_proc "/product" do |req, res|
       next
     end
     
-    product = $products.find { |p| p[:id] == id }
+    product = $db.get_product(id)
 
     if product.nil?
       send_json_response(res, { error: "Product not found" }, 404)
@@ -211,6 +282,10 @@ server.mount_proc "/product" do |req, res|
       send_json_response(res, product)
 
     when "PUT"
+      # Require authentication for PUT
+      user = require_auth(req, res)
+      return unless user
+      
       data = parse_body(req)
       
       # Validate update data
@@ -222,16 +297,23 @@ server.mount_proc "/product" do |req, res|
         end
       end
       
-      # Sanitize and update fields if provided
+      # Sanitize and update product
       sanitized = sanitize_product_data(data)
-      product[:name] = sanitized[:name] if sanitized[:name] && !sanitized[:name].empty?
-      product[:price] = sanitized[:price] if sanitized[:price] > 0
-      product[:category] = sanitized[:category] if sanitized[:category]
+      updated_product = $db.update_product(
+        id,
+        name: sanitized[:name],
+        price: sanitized[:price],
+        category: sanitized[:category]
+      )
       
-      send_json_response(res, product)
+      send_json_response(res, updated_product)
 
     when "DELETE"
-      $products.delete(product)
+      # Require authentication for DELETE
+      user = require_auth(req, res)
+      return unless user
+      
+      deleted_product = $db.delete_product(id)
       send_json_response(res, { message: "Product deleted successfully" })
 
     else

@@ -4,36 +4,49 @@ require "uri"
 
 class APITester
   BASE_URL = "http://localhost:3000"
+  API_KEY = nil
   
   def self.run_tests
-    puts "🧪 Running API Tests..."
+    puts "🧪 Running Enhanced API Tests..."
     puts "=" * 50
     
     # Test 1: Root endpoint
     test_root_endpoint
     
-    # Test 2: Create product
+    # Test 2: Health check
+    test_health_endpoint
+    
+    # Test 3: Register user and get API key
+    API_KEY = test_register_user
+    
+    # Test 4: Create product (with auth)
     product_id = test_create_product
     
-    # Test 3: Get all products
+    # Test 5: Get all products
     test_get_products
     
-    # Test 4: Search products
+    # Test 6: Search products
     test_search_products
     
-    # Test 5: Get specific product
+    # Test 7: Get specific product
     test_get_product(product_id) if product_id
     
-    # Test 6: Update product
+    # Test 8: Update product (with auth)
     test_update_product(product_id) if product_id
     
-    # Test 7: Test validation
+    # Test 9: Test validation
     test_validation
     
-    # Test 8: Delete product
+    # Test 10: Test authentication failure
+    test_auth_failure
+    
+    # Test 11: Delete product (with auth)
     test_delete_product(product_id) if product_id
     
-    # Test 9: Rate limiting
+    # Test 12: Metrics endpoint
+    test_metrics_endpoint
+    
+    # Test 13: Rate limiting
     test_rate_limiting
     
     puts "=" * 50
