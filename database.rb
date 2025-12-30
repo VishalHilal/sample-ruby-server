@@ -2,7 +2,8 @@ require "sqlite3"
 require "json"
 
 class Database
-  def initialize(db_path = "products.db")
+  def initialize(db_path = nil)
+    db_path ||= File.join(Dir.pwd, "data", "products.db")
     @db = SQLite3::Database.new(db_path)
     @db.results_as_hash = true
     setup_tables
@@ -15,6 +16,8 @@ class Database
         name TEXT NOT NULL,
         price REAL NOT NULL,
         category TEXT,
+        image_url TEXT,
+        stock INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
@@ -28,6 +31,19 @@ class Database
         password_hash TEXT NOT NULL,
         api_key TEXT UNIQUE,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    SQL
+    
+    @db.execute <<-SQL
+      CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        user_id INTEGER,
+        rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+        comment TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
       )
     SQL
     
@@ -46,10 +62,10 @@ class Database
   end
   
   # Product operations
-  def create_product(name, price, category = nil)
+  def create_product(name, price, category = nil, image_url = nil, stock = 0)
     @db.execute(
-      "INSERT INTO products (name, price, category) VALUES (?, ?, ?)",
-      [name, price, category]
+      "INSERT INTO products (name, price, category, image_url, stock) VALUES (?, ?, ?, ?, ?)",
+      [name, price, category, image_url, stock]
     )
     get_product(@db.last_insert_rowid)
   end
@@ -74,7 +90,7 @@ class Database
     @db.execute(query, params)
   end
   
-  def update_product(id, name: nil, price: nil, category: nil)
+  def update_product(id, name: nil, price: nil, category: nil, image_url: nil, stock: nil)
     updates = []
     params = []
     
@@ -91,6 +107,16 @@ class Database
     if category
       updates << "category = ?"
       params << category
+    end
+    
+    if image_url
+      updates << "image_url = ?"
+      params << image_url
+    end
+    
+    if stock
+      updates << "stock = ?"
+      params << stock
     end
     
     return nil if updates.empty?
@@ -149,6 +175,81 @@ class Database
       requests_today: @db.execute("SELECT COUNT(*) as count FROM api_logs WHERE DATE(created_at) = DATE('now')").first["count"],
       error_rate: @db.execute("SELECT (COUNT(*) * 100.0 / (SELECT COUNT(*) FROM api_logs)) as rate FROM api_logs WHERE status_code >= 400").first["rate"]
     }
+  end
+  
+  # Review operations
+  def create_review(product_id, user_id, rating, comment = nil)
+    @db.execute(
+      "INSERT INTO reviews (product_id, user_id, rating, comment) VALUES (?, ?, ?, ?)",
+      [product_id, user_id, rating, comment]
+    )
+    get_review(@db.last_insert_rowid)
+  end
+  
+  def get_review(id)
+    result = @db.execute(
+      "SELECT r.*, u.username, p.name as product_name FROM reviews r 
+       LEFT JOIN users u ON r.user_id = u.id 
+       LEFT JOIN products p ON r.product_id = p.id 
+       WHERE r.id = ?", 
+      [id]
+    )
+    result.first
+  end
+  
+  def get_product_reviews(product_id, limit = 50, offset = 0)
+    @db.execute(
+      "SELECT r.*, u.username FROM reviews r 
+       LEFT JOIN users u ON r.user_id = u.id 
+       WHERE r.product_id = ? 
+       ORDER BY r.created_at DESC 
+       LIMIT ? OFFSET ?", 
+      [product_id, limit, offset]
+    )
+  end
+  
+  def get_product_rating_summary(product_id)
+    result = @db.execute(
+      "SELECT COUNT(*) as total_reviews, AVG(rating) as avg_rating 
+       FROM reviews WHERE product_id = ?", 
+      [product_id]
+    ).first
+    
+    if result["total_reviews"] > 0
+      {
+        total_reviews: result["total_reviews"],
+        average_rating: result["avg_rating"].round(2)
+      }
+    else
+      { total_reviews: 0, average_rating: 0 }
+    end
+  end
+  
+  def update_review(id, rating: nil, comment: nil)
+    updates = []
+    params = []
+    
+    if rating
+      updates << "rating = ?"
+      params << rating
+    end
+    
+    if comment
+      updates << "comment = ?"
+      params << comment
+    end
+    
+    return nil if updates.empty?
+    
+    params << id
+    @db.execute("UPDATE reviews SET #{updates.join(', ')} WHERE id = ?", params)
+    get_review(id)
+  end
+  
+  def delete_review(id)
+    review = get_review(id)
+    @db.execute("DELETE FROM reviews WHERE id = ?", [id])
+    review
   end
   
   private

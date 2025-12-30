@@ -7,6 +7,7 @@ require "bcrypt"
 require_relative "middleware"
 require_relative "database"
 require_relative "auth"
+require_relative "file_upload"
 
 server = WEBrick::HTTPServer.new(
   Port: 3000
@@ -15,6 +16,9 @@ server = WEBrick::HTTPServer.new(
 # Database and authentication
 $db = Database.new
 $start_time = Time.now
+
+# Static file serving for uploads
+server.mount("/uploads", WEBrick::HTTPServlet::FileHandler, File.join(Dir.pwd, "public", "uploads"))
 
 # Helper to parse JSON body
 def parse_body(req)
@@ -112,11 +116,14 @@ server.mount_proc "/" do |req, res|
         "GET /health" => "Health check endpoint",
         "GET /metrics" => "API performance metrics",
         "POST /auth/register" => "Register user and get API key",
+        "POST /upload" => "Upload product image (requires auth)",
         "GET /products" => "List all products (supports pagination and search)",
         "POST /products" => "Create a new product (requires auth)",
         "GET /product?id=:id" => "Get a specific product",
         "PUT /product?id=:id" => "Update a specific product (requires auth)",
-        "DELETE /product?id=:id" => "Delete a specific product (requires auth)"
+        "DELETE /product?id=:id" => "Delete a specific product (requires auth)",
+        "POST /reviews" => "Create product review (requires auth)",
+        "GET /product/reviews?product_id=:id" => "Get product reviews and ratings"
       },
       examples: {
         create_product: { name: "Example Product", price: "29.99", category: "electronics" },
@@ -195,6 +202,31 @@ server.mount_proc "/auth/register" do |req, res|
   end
 end
 
+# File upload endpoint
+server.mount_proc "/upload" do |req, res|
+  apply_middleware(req, res) do
+    if req.request_method == "POST"
+      # Require authentication
+      user = require_auth(req, res)
+      return unless user
+      
+      # Handle file upload
+      upload_result = FileUploadManager.upload_file(req, res)
+      
+      if upload_result[:error]
+        send_json_response(res, { error: upload_result[:error] }, 400)
+      else
+        send_json_response(res, {
+          message: "File uploaded successfully",
+          file: upload_result
+        }, 201)
+      end
+    else
+      send_json_response(res, { error: "Method Not Allowed" }, 405)
+    end
+  end
+end
+
 # GET /products -> list all products with pagination and search
 server.mount_proc "/products" do |req, res|
   apply_middleware(req, res) do
@@ -245,7 +277,9 @@ server.mount_proc "/products" do |req, res|
       product = $db.create_product(
         sanitized[:name],
         sanitized[:price],
-        sanitized[:category]
+        sanitized[:category],
+        data["image_url"],
+        data["stock"] || 0
       )
 
       send_json_response(res, product, 201)
@@ -303,7 +337,9 @@ server.mount_proc "/product" do |req, res|
         id,
         name: sanitized[:name],
         price: sanitized[:price],
-        category: sanitized[:category]
+        category: sanitized[:category],
+        image_url: data["image_url"],
+        stock: data["stock"]
       )
       
       send_json_response(res, updated_product)
@@ -316,6 +352,72 @@ server.mount_proc "/product" do |req, res|
       deleted_product = $db.delete_product(id)
       send_json_response(res, { message: "Product deleted successfully" })
 
+    else
+      send_json_response(res, { error: "Method Not Allowed" }, 405)
+    end
+  end
+end
+
+# Reviews endpoints
+server.mount_proc "/reviews" do |req, res|
+  apply_middleware(req, res) do
+    if req.request_method == "OPTIONS"
+      send_json_response(res, "", 200)
+      next
+    end
+
+    if req.request_method == "POST"
+      # Require authentication
+      user = require_auth(req, res)
+      return unless user
+      
+      data = parse_body(req)
+      
+      # Validate required fields
+      errors = []
+      errors << "Product ID required" if data["product_id"].nil?
+      errors << "Rating required (1-5)" if data["rating"].nil? || !(1..5).include?(data["rating"].to_i)
+      
+      if errors.any?
+        send_json_response(res, { errors: errors }, 400)
+        next
+      end
+      
+      # Create review
+      review = $db.create_review(
+        data["product_id"].to_i,
+        user["id"],
+        data["rating"].to_i,
+        data["comment"]
+      )
+      
+      send_json_response(res, review, 201)
+    else
+      send_json_response(res, { error: "Method Not Allowed" }, 405)
+    end
+  end
+end
+
+# Product-specific reviews
+server.mount_proc "/product/reviews" do |req, res|
+  apply_middleware(req, res) do
+    if req.request_method == "GET"
+      product_id = req.query["product_id"]&.to_i
+      
+      if product_id.nil? || product_id <= 0
+        send_json_response(res, { error: "Valid product ID required" }, 400)
+        next
+      end
+      
+      # Get reviews and rating summary
+      reviews = $db.get_product_reviews(product_id)
+      rating_summary = $db.get_product_rating_summary(product_id)
+      
+      send_json_response(res, {
+        product_id: product_id,
+        rating_summary: rating_summary,
+        reviews: reviews
+      })
     else
       send_json_response(res, { error: "Method Not Allowed" }, 405)
     end

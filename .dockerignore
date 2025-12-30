@@ -1,0 +1,8 @@
+# Docker ignore file
+.git
+.gitignore
+README.md
+.env
+*.log
+.DS_Store
+coverage/
