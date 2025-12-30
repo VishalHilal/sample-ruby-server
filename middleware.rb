@@ -4,13 +4,24 @@ class RateLimiter
     @max_requests = max_requests
     @window_seconds = window_seconds
     @requests = {}
+    @failed_auths = {}
   end
   
   def allow_request?(ip)
     now = Time.now
-    @requests[ip] ||= []
+    
+    # Check if IP is blocked due to auth failures
+    if @failed_auths[ip] && @failed_auths[ip][:count] >= 5
+      block_time = @failed_auths[ip][:blocked_until]
+      if now < block_time
+        return false # Still blocked
+      else
+        @failed_auths.delete(ip) # Unblock
+      end
+    end
     
     # Remove old requests outside the window
+    @requests[ip] ||= []
     @requests[ip] = @requests[ip].select { |time| now - time < @window_seconds }
     
     if @requests[ip].length < @max_requests
@@ -18,6 +29,15 @@ class RateLimiter
       true
     else
       false
+    end
+  end
+  
+  def record_auth_failure(ip)
+    @failed_auths[ip] ||= { count: 0, blocked_until: nil }
+    @failed_auths[ip][:count] += 1
+    
+    if @failed_auths[ip][:count] >= 5
+      @failed_auths[ip][:blocked_until] = Time.now + 900 # Block for 15 minutes
     end
   end
 end

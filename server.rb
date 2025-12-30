@@ -10,7 +10,11 @@ require_relative "auth"
 require_relative "file_upload"
 
 server = WEBrick::HTTPServer.new(
-  Port: 3000
+  Port: 3000,
+  MaxRequestBodySize: 10 * 1024 * 1024, # 10MB limit
+  RequestTimeout: 30, # 30 second timeout
+  Logger: WEBrick::Log.new('/dev/null'),
+  AccessLog: []
 )
 
 # Database and authentication
@@ -31,7 +35,12 @@ end
 def set_cors_headers(res)
   res["Access-Control-Allow-Origin"] = "*"
   res["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-  res["Access-Control-Allow-Headers"] = "Content-Type"
+  res["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+  # Security headers
+  res["X-Content-Type-Options"] = "nosniff"
+  res["X-Frame-Options"] = "DENY"
+  res["X-XSS-Protection"] = "1; mode=block"
+  res["Referrer-Policy"] = "strict-origin-when-cross-origin"
 end
 
 # Helper to validate product data
@@ -72,7 +81,7 @@ def apply_middleware(req, res)
   
   # Rate limiting
   unless $rate_limiter.allow_request?(req.remote_ip)
-    send_json_response(res, { error: "Rate limit exceeded. Try again later." }, 429)
+    send_json_response(res, { error: "Rate limit exceeded or IP blocked. Try again later." }, 429)
     return false
   end
   
@@ -100,6 +109,7 @@ end
 def require_auth(req, res)
   user = AuthManager.authenticate_request(req, $db)
   unless user
+    $rate_limiter.record_auth_failure(req.remote_ip)
     send_json_response(res, { error: "Authentication required" }, 401)
     return false
   end
